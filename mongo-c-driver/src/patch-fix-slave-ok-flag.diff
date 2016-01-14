@@ -1,0 +1,198 @@
+diff --git a/src/gridfs.c b/src/gridfs.c
+index f51b397..66f8d88 100644
+--- a/src/gridfs.c
++++ b/src/gridfs.c
+@@ -43,7 +43,7 @@ int gridfs_init( mongo *client, const char *dbname, const char *prefix,
+ 
+     int options;
+     bson b;
+-    bson_bool_t success;
++    bson_bool_t success = 1;
+ 
+     gfs->client = client;
+ 
+@@ -76,7 +76,9 @@ int gridfs_init( mongo *client, const char *dbname, const char *prefix,
+     bson_append_int( &b, "filename", 1 );
+     bson_finish( &b );
+     options = 0;
+-    success = ( mongo_create_index( gfs->client, gfs->files_ns, &b, options, NULL ) == MONGO_OK );
++    // if not primary/master then ignore
++    if ( gfs->client->ismaster )
++        success = ( mongo_create_index( gfs->client, gfs->files_ns, &b, options, NULL ) == MONGO_OK );
+     bson_destroy( &b );
+     if ( !success ) {
+         bson_free( ( char * )gfs->dbname );
+@@ -91,7 +93,9 @@ int gridfs_init( mongo *client, const char *dbname, const char *prefix,
+     bson_append_int( &b, "n", 1 );
+     bson_finish( &b );
+     options = MONGO_INDEX_UNIQUE;
+-    success = ( mongo_create_index( gfs->client, gfs->chunks_ns, &b, options, NULL ) == MONGO_OK );
++    // if not primary/master then ignore
++    if ( gfs->client->ismaster )
++        success = ( mongo_create_index( gfs->client, gfs->chunks_ns, &b, options, NULL ) == MONGO_OK );
+     bson_destroy( &b );
+     if ( !success ) {
+         bson_free( ( char * )gfs->dbname );
+diff --git a/src/mongo.c b/src/mongo.c
+index 021c46a..62f174a 100644
+--- a/src/mongo.c
++++ b/src/mongo.c
+@@ -139,6 +139,7 @@ static int mongo_check_is_master( mongo *conn ) {
+     if ( mongo_simple_int_command( conn, "admin", "ismaster", 1, &out ) == MONGO_OK ) {
+         if( bson_find( &it, &out, "ismaster" ) )
+             ismaster = bson_iterator_bool( &it );
++            conn->ismaster = ismaster;
+     } else {
+         return MONGO_ERROR;
+     }
+@@ -164,7 +165,7 @@ void mongo_init( mongo *conn ) {
+     conn->op_timeout_ms = 0;
+ }
+ 
+-int mongo_connect( mongo *conn , const char *host, int port ) {
++int mongo_connect( mongo *conn , const char *host, int port, int option ) {
+     conn->primary = bson_malloc( sizeof( mongo_host_port ) );
+     strncpy( conn->primary->host, host, strlen( host ) + 1 );
+     conn->primary->port = port;
+@@ -174,7 +175,7 @@ int mongo_connect( mongo *conn , const char *host, int port ) {
+     if( mongo_socket_connect( conn, host, port ) != MONGO_OK )
+         return MONGO_ERROR;
+ 
+-    if( mongo_check_is_master( conn ) != MONGO_OK )
++    if( option == MONGO_PRIMARY_ONLY && mongo_check_is_master( conn ) != MONGO_OK )
+         return MONGO_ERROR;
+     else
+         return MONGO_OK;
+@@ -312,6 +313,7 @@ static int mongo_replset_check_host( mongo *conn ) {
+     if ( mongo_simple_int_command( conn, "admin", "ismaster", 1, &out ) == MONGO_OK ) {
+         if( bson_find( &it, &out, "ismaster" ) )
+             ismaster = bson_iterator_bool( &it );
++            conn->ismaster = ismaster;
+ 
+         if( bson_find( &it, &out, "setName" ) ) {
+             set_name = bson_iterator_string( &it );
+@@ -334,7 +336,7 @@ static int mongo_replset_check_host( mongo *conn ) {
+     return MONGO_OK;
+ }
+ 
+-int mongo_replset_connect( mongo *conn ) {
++int mongo_replset_connect( mongo *conn, int option ) {
+ 
+     int res = 0;
+     mongo_host_port *node;
+@@ -372,16 +374,20 @@ int mongo_replset_connect( mongo *conn ) {
+             if( res == MONGO_OK ) {
+                 if( mongo_replset_check_host( conn ) != MONGO_OK )
+                     return MONGO_ERROR;
+-
+-                /* Primary found, so return. */
+-                else if( conn->replset->primary_connected )
+-                    return MONGO_OK;
+-
+-                /* No primary, so close the connection. */
+                 else {
+-                    mongo_close_socket( conn->sock );
+-                    conn->sock = 0;
+-                    conn->connected = 0;
++                    if ( option == MONGO_SECONDARY_OK )
++                        return MONGO_OK;
++
++                    /* Primary found, so return. */
++                    if( conn->replset->primary_connected )
++                        return MONGO_OK;
++
++                    /* No primary, so close the connection. */
++                    else {
++                        mongo_close_socket( conn->sock );
++                        conn->sock = 0;
++                        conn->connected = 0;
++                    }
+                 }
+             }
+ 
+@@ -402,7 +408,7 @@ int mongo_set_op_timeout( mongo *conn, int millis ) {
+     return MONGO_OK;
+ }
+ 
+-int mongo_reconnect( mongo *conn ) {
++int mongo_reconnect( mongo *conn, int option ) {
+     int res;
+     mongo_disconnect( conn );
+ 
+@@ -410,7 +416,7 @@ int mongo_reconnect( mongo *conn ) {
+         conn->replset->primary_connected = 0;
+         mongo_replset_free_list( &conn->replset->hosts );
+         conn->replset->hosts = NULL;
+-        res = mongo_replset_connect( conn );
++        res = mongo_replset_connect( conn, option );
+         return res;
+     } else
+         return mongo_socket_connect( conn, conn->primary->host, conn->primary->port );
+@@ -731,6 +737,7 @@ mongo_cursor *mongo_find( mongo *conn, const char *ns, bson *query,
+     mongo_cursor_set_fields( cursor, fields );
+     mongo_cursor_set_limit( cursor, limit );
+     mongo_cursor_set_skip( cursor, skip );
++    if ( !conn->ismaster ) options |= MONGO_SLAVE_OK;
+     mongo_cursor_set_options( cursor, options );
+ 
+     if( mongo_cursor_op_query( cursor ) == MONGO_OK )
+@@ -1102,6 +1109,7 @@ bson_bool_t mongo_cmd_ismaster( mongo *conn, bson *realout ) {
+         bson_iterator it;
+         bson_find( &it, &out, "ismaster" );
+         ismaster = bson_iterator_bool( &it );
++        conn->ismaster = ismaster;
+     }
+ 
+     if( realout )
+diff --git a/src/mongo.h b/src/mongo.h
+index 6f86174..2dbd361 100644
+--- a/src/mongo.h
++++ b/src/mongo.h
+@@ -80,6 +80,11 @@ enum mongo_cursor_opts {
+     MONGO_PARTIAL = ( 1<<7 )          /**< Allow reads even if a shard is down. */
+ };
+ 
++enum mongo_connect_opts {
++    MONGO_PRIMARY_ONLY,
++    MONGO_SECONDARY_OK
++};
++
+ enum mongo_operations {
+     MONGO_OP_MSG = 1000,
+     MONGO_OP_UPDATE = 2001,
+@@ -143,6 +148,8 @@ typedef struct mongo {
+     char *errstr;              /**< String version of most recent driver error code. */
+     int lasterrcode;           /**< getlasterror given by the server on calls. */
+     char *lasterrstr;          /**< getlasterror string generated by server. */
++
++    int ismaster;
+ } mongo;
+ 
+ typedef struct {
+@@ -184,7 +191,7 @@ void mongo_init( mongo *conn );
+  * @return MONGO_OK or MONGO_ERROR on failure. On failure, a constant of type
+  *   mongo_conn_return_t will be set on the conn->err field.
+  */
+-int mongo_connect( mongo *conn , const char *host, int port );
++int mongo_connect( mongo *conn , const char *host, int port, int option);
+ 
+ /**
+  * Set up this connection object for connecting to a replica set.
+@@ -226,7 +233,7 @@ void mongo_parse_host( const char *host_string, mongo_host_port *host_port );
+  * @return MONGO_OK or MONGO_ERROR on failure. On failure, a constant of type
+  *   mongo_conn_return_t will be set on the conn->err field.
+  */
+-int mongo_replset_connect( mongo *conn );
++int mongo_replset_connect( mongo *conn, int option );
+ 
+ /** Set a timeout for operations on this connection. This
+  *  is a platform-specific feature, and only work on *nix
+@@ -261,7 +268,7 @@ int mongo_check_connection( mongo *conn );
+  * @return MONGO_OK or MONGO_ERROR and
+  *   set the conn->err field.
+  */
+-int mongo_reconnect( mongo *conn );
++int mongo_reconnect( mongo *conn, int option );
+ 
+ /**
+  * Close the current connection to the server. After calling
